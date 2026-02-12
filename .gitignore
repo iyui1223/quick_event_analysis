@@ -1,0 +1,35 @@
+# Ignore all executable, binary and data files
+*.npy
+*.npz
+*.zarr
+*.bin
+*.pkl
+*.h5
+*.nc
+*.hdf5
+Data/
+Models/
+__pycache__/
+Figs/
+old/
+tmp/
+
+# log files
+*.out
+*.err
+*.log
+
+# Temporary work directory
+Work/
+workdir/
+.ipynb_checkpoints/
+Viewer/
+
+
+# Hidden system files (Mac and Linux)
+.DS_Store
+Thumbs.
+.ipynb_checkpoints
+
+# NFS temporary files
+.nfs*
