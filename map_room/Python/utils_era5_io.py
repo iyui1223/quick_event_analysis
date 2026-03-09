@@ -34,6 +34,21 @@ def get_era5_msl_paths(era5_msl_dir: Path, start_year: int, end_year: int) -> Li
     return sorted(paths)
 
 
+def get_era5_u_paths(era5_u_dir: Path, start_year: int, end_year: int) -> List[Path]:
+    """
+    Return list of existing ERA5 daily U-wind files for year range.
+    grads_ctl layout: era5_daily_u_component_of_wind_YYYY.nc (all 37 levels in one file).
+    """
+    if not era5_u_dir.exists():
+        return []
+    paths = []
+    for year in range(start_year, end_year + 1):
+        p = era5_u_dir / f"era5_daily_u_component_of_wind_{year}.nc"
+        if p.exists():
+            paths.append(p)
+    return sorted(paths)
+
+
 def open_era5_daily(
     paths: List[Path],
     var_name: str = "t2m",

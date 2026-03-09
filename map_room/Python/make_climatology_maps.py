@@ -11,7 +11,7 @@ import gc
 import os
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import xarray as xr
@@ -20,10 +20,9 @@ from utils_era5_io import (
     get_project_root,
     get_era5_t2m_paths,
     get_era5_msl_paths,
+    get_era5_u_paths,
     open_era5_one_year,
 )
-from utils_plot_polar import plot_polar_map
-
 ROOT = get_project_root()
 
 
@@ -120,6 +119,77 @@ def compute_monthly_climatology_year_by_year(
     return clim_t2m_da, clim_msl_da
 
 
+def _sel_level(da: xr.DataArray, level_hpa: int) -> xr.DataArray:
+    """Select pressure level from DataArray; level coord may be level, lev, plev, etc."""
+    for dim in ("level", "lev", "plev", "pressure"):
+        if dim in da.coords:
+            out = da.sel({dim: level_hpa}, method="nearest").squeeze()
+            return out
+    raise ValueError(f"No level dimension in {list(da.coords)}; cannot select {level_hpa} hPa")
+
+
+def compute_monthly_climatology_u_year_by_year(
+    era_name: str,
+    start_year: int,
+    end_year: int,
+    month: int,
+    u_dir: Path,
+    lat_cutoff: float,
+) -> Tuple[xr.DataArray, xr.DataArray]:
+    """
+    Compute U850 and U500 climatology for one (era, month) by accumulating over years.
+    Reads era5_daily_u_component_of_wind_YYYY.nc (all levels in one file), selects 850 and 500 hPa.
+    Returns (clim_u850, clim_u500) with same coords (lat, lon).
+    """
+    paths = get_era5_u_paths(u_dir, start_year, end_year)
+    if not paths:
+        raise FileNotFoundError(f"No U-wind files in {u_dir} for {start_year}-{end_year}")
+
+    month_sum_u850 = None
+    month_sum_u500 = None
+    n_days = 0
+    template = None
+
+    for path in paths:
+        year = int(path.stem.split("_")[-1])
+        ds = open_era5_one_year(path, lat_south_of=lat_cutoff, chunks={"time": 31})
+        da_u = _get_var(ds, ["u", "U"])
+        da_u850 = _sel_level(da_u, 850)
+        da_u500 = _sel_level(da_u, 500)
+        u850_month = da_u850.sel(time=da_u850.time.dt.month == month).load()
+        u500_month = da_u500.sel(time=da_u500.time.dt.month == month).load()
+        n = u850_month.sizes.get("time", 0)
+        if n == 0:
+            ds.close()
+            del ds, da_u, da_u850, da_u500, u850_month, u500_month
+            gc.collect()
+            continue
+        u850_sum = u850_month.sum(dim="time")
+        u500_sum = u500_month.sum(dim="time")
+        if month_sum_u850 is None:
+            month_sum_u850 = u850_sum.values.astype(np.float64)
+            month_sum_u500 = u500_sum.values.astype(np.float64)
+            template = u850_sum
+        else:
+            month_sum_u850 += u850_sum.values
+            month_sum_u500 += u500_sum.values
+        n_days += n
+        ds.close()
+        del ds, da_u, da_u850, da_u500, u850_month, u500_month, u850_sum, u500_sum
+        gc.collect()
+
+    if month_sum_u850 is None or n_days == 0:
+        raise RuntimeError(f"No U data for era {era_name} month {month}")
+
+    clim_u850 = month_sum_u850 / n_days
+    clim_u500 = month_sum_u500 / n_days
+    dims = list(template.dims)
+    coords = {c: template.coords[c] for c in dims}
+    clim_u850_da = xr.DataArray(clim_u850, dims=dims, coords=coords, name="u850")
+    clim_u500_da = xr.DataArray(clim_u500, dims=dims, coords=coords, name="u500")
+    return clim_u850_da, clim_u500_da
+
+
 def run_era(
     era_name: str,
     start_year: int,
@@ -130,6 +200,7 @@ def run_era(
     months: list,
     data_dir: Path,
     figs_dir: Path,
+    u_dir: Optional[Path] = None,
 ) -> None:
     """Compute and save climatology NetCDF and figures for one era (year-by-year, low memory)."""
     month_names = {"12": "12", "1": "01", "2": "02", "3": "03"}
@@ -147,49 +218,28 @@ def run_era(
             {"t2m": clim_t2m.expand_dims(time=t0), "msl": clim_msl.expand_dims(time=t0)}
         )
         ds_out.to_netcdf(out_nc)
-        fig_dir = figs_dir / era_name / mstr
-        fig_dir.mkdir(parents=True, exist_ok=True)
-        plot_polar_map(
-            clim_t2m,
-            fig_dir / "t2m_msl.png",
-            title=f"Climatology {era_name} month {mstr}",
-            cmap="viridis",
-            contours=clim_msl,
-            contour_levels=14,
-            colorbar_label="t2m (K)",
-        )
         del clim_t2m, clim_msl
         gc.collect()
 
-
-def run_diff(
-    past_name: str,
-    present_name: str,
-    months: list,
-    data_dir: Path,
-    figs_dir: Path,
-) -> None:
-    """Era B − Era A difference maps (reads small clim NetCDFs)."""
-    month_names = {"12": "12", "1": "01", "2": "02", "3": "03"}
-    for month in months:
-        mstr = month_names.get(str(month), str(month).zfill(2))
-        past_ds = xr.open_dataset(data_dir / past_name / mstr / "clim.nc")
-        pres_ds = xr.open_dataset(data_dir / present_name / mstr / "clim.nc")
-        diff_t2m = pres_ds["t2m"] - past_ds["t2m"]
-        diff_msl = pres_ds["msl"] - past_ds["msl"]
-        out_fig = figs_dir / "diff" / mstr / "t2m_msl_diff.png"
-        out_fig.parent.mkdir(parents=True, exist_ok=True)
-        plot_polar_map(
-            diff_t2m,
-            out_fig,
-            title=f"Difference (present − past) month {mstr}",
-            cmap="RdBu_r",
-            contours=diff_msl,
-            contour_levels=12,
-            colorbar_label="t2m diff (K)",
-        )
-        past_ds.close()
-        pres_ds.close()
+        # U850/U500 climatology if U dir set and has data (grads_ctl: all levels in one file)
+        if u_dir is not None:
+            try:
+                clim_u850, clim_u500 = compute_monthly_climatology_u_year_by_year(
+                    era_name, start_year, end_year, month, u_dir, lat_cutoff
+                )
+                out_u = data_dir / era_name / mstr / "clim_u.nc"
+                t0 = xr.DataArray([np.datetime64("2000-01-01")], dims=["time"])
+                ds_u = xr.Dataset(
+                    {
+                        "u850": clim_u850.expand_dims(time=t0),
+                        "u500": clim_u500.expand_dims(time=t0),
+                    }
+                )
+                ds_u.to_netcdf(out_u)
+                del clim_u850, clim_u500, ds_u
+                gc.collect()
+            except FileNotFoundError as e:
+                print(f"    Skip U (no data): {e}", flush=True)
 
 
 def main():
@@ -207,6 +257,11 @@ def main():
 
     t2m_dir = Path(os.environ.get("ERA5_T2M_DIR", str(ROOT / "Data")))
     msl_dir = Path(os.environ.get("ERA5_MSL_DIR", str(ROOT / "Data")))
+    u_dir = Path(os.environ["ERA5_U_DIR"]) if os.environ.get("ERA5_U_DIR") else None
+    if u_dir is not None and not u_dir.exists():
+        print("ERA5_U_DIR missing; skipping U climatology.", flush=True)
+        u_dir = None
+
     # Use passed paths as-is (Slurm passes DATA_DIR/F01_climatology); default adds F01_climatology
     data_dir = (
         Path(args.data_dir)
@@ -230,6 +285,7 @@ def main():
         months,
         data_dir,
         figs_dir,
+        u_dir=u_dir,
     )
     run_era(
         present["name"],
@@ -241,10 +297,10 @@ def main():
         months,
         data_dir,
         figs_dir,
+        u_dir=u_dir,
     )
-    print("Difference maps...", flush=True)
-    run_diff(past["name"], present["name"], months, data_dir, figs_dir)
-    print("F01 done. Outputs under", data_dir, "and", figs_dir)
+    print("F01 done. NetCDFs under", data_dir, flush=True)
+    print("Run Sh/run_plot_climatology_grads.sh for GrADS figures.", flush=True)
 
 
 if __name__ == "__main__":

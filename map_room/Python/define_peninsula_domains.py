@@ -92,6 +92,195 @@ def classify_slopes(
     return west, east
 
 
+def build_full_domain_masks(
+    lsm: xr.DataArray,
+    pen_box: dict,
+    ridge_lon: xr.DataArray,
+) -> xr.Dataset:
+    """
+    Build all analysis domains on the full Antarctic grid (lat ≤ -55, all lon).
+
+    Domains (all boolean → int8):
+      peninsula_land   — land inside peninsula bounding box
+      pen_west_slope   — peninsula land west of ridge
+      pen_east_slope   — peninsula land east of ridge
+      west_ocean       — ocean, lon 255-300, lat ≤ -60, trimmed east of AP
+      east_ocean       — ocean, lon 300-345, lat ≤ -60, minus peninsula box
+      inland           — land, lon 255-345, lat ≤ -75
+    """
+    lat = lsm.lat
+    lon = lsm.lon
+    land = lsm > 0.5
+    ocean = ~land
+
+    # ---- Peninsula (reindex onto full grid, fill False) ----
+    pen_land_local = land.sel(
+        lat=slice(pen_box["lat_min"], pen_box["lat_max"]),
+        lon=slice(pen_box["lon_min"], pen_box["lon_max"]),
+    )
+    peninsula = pen_land_local.reindex_like(lsm, fill_value=False)
+
+    elev_pen = lsm.sel(
+        lat=slice(pen_box["lat_min"], pen_box["lat_max"]),
+        lon=slice(pen_box["lon_min"], pen_box["lon_max"]),
+    )
+    lon_pen = elev_pen.lon
+    lat_pen = elev_pen.lat
+
+    ridge_2d = ridge_lon.reindex(lat=lat_pen, method="nearest").broadcast_like(elev_pen)
+    lon_2d_pen = xr.broadcast(lon_pen, lat_pen)[0]
+
+    pen_west_local = pen_land_local & (lon_2d_pen <= ridge_2d)
+    pen_east_local = pen_land_local & (lon_2d_pen > ridge_2d)
+    pen_west = pen_west_local.reindex_like(lsm, fill_value=False)
+    pen_east = pen_east_local.reindex_like(lsm, fill_value=False)
+
+    # ---- West Ocean: lon 255-300, lat ≤ -60, ocean ----
+    in_west_box = (lon >= 255) & (lon <= 300) & (lat <= -60)
+    west_ocean = ocean & in_west_box
+
+    # Trim fringe east of AP: for each lat in peninsula range,
+    # find the easternmost land point in the west-ocean lon range
+    # and remove ocean east of it.
+    for lat_val in lat.values:
+        if lat_val > pen_box["lat_min"] and lat_val < pen_box["lat_max"]:
+            row_land = land.sel(lat=lat_val, lon=slice(255, 300))
+            if row_land.any():
+                land_lons = row_land.lon.values[row_land.values]
+                if len(land_lons) > 0:
+                    east_coast = float(land_lons.max())
+                    west_ocean.loc[dict(lat=lat_val)] = (
+                        west_ocean.sel(lat=lat_val) & (lon <= east_coast)
+                    )
+
+    # ---- East Ocean: lon 300-345, lat ≤ -60, ocean ----
+    # Includes ocean surrounding the peninsula east of 60°W (lon 300).
+    in_east_box = (lon >= 300) & (lon <= 345) & (lat <= -60)
+    east_ocean = ocean & in_east_box
+
+    # ---- Inland: lon 255-345, lat ≤ -75, land ----
+    in_inland_box = (lon >= 255) & (lon <= 345) & (lat <= -75)
+    inland = land & in_inland_box
+
+    masks = xr.Dataset(
+        {
+            "peninsula_land": peninsula.astype(np.int8),
+            "pen_west_slope": pen_west.astype(np.int8),
+            "pen_east_slope": pen_east.astype(np.int8),
+            "west_ocean": west_ocean.astype(np.int8),
+            "east_ocean": east_ocean.astype(np.int8),
+            "inland": inland.astype(np.int8),
+        },
+        attrs={
+            "description": "Antarctic Peninsula analysis domains on ERA5 grid",
+            "peninsula_box": str(pen_box),
+            "west_ocean_box": "lon 255-300, lat <= -60, ocean, trimmed E of AP",
+            "east_ocean_box": "lon 300-345, lat <= -60, ocean (incl. around peninsula)",
+            "inland_box": "lon 255-345, lat <= -75, land",
+        },
+    )
+
+    for name in masks.data_vars:
+        n = int(masks[name].sum())
+        print(f"  {name:20s}  {n:6d} grid points")
+
+    return masks
+
+
+def plot_all_domains(
+    masks: xr.Dataset,
+    lsm: xr.DataArray,
+    pen_box: dict,
+    t2m_clim: xr.DataArray | None,
+    out_path: Path,
+) -> None:
+    """
+    Single-panel polar stereographic map covering all Antarctica.
+    Colour-shaded domains, coastline, and optional t2m March climatology contours.
+    """
+    if not HAS_CARTOPY:
+        print("Cartopy required — skipping all-domain plot.")
+        return
+
+    from matplotlib.colors import ListedColormap
+
+    proj = ccrs.SouthPolarStereo()
+    data_crs = ccrs.PlateCarree()
+    # Reduce line-segment threshold so cartopy subdivides contour paths
+    # into short arcs that project as smooth curves at high latitudes.
+    data_crs._threshold = data_crs._threshold / 100
+
+    fig = plt.figure(figsize=(11, 11))
+    ax = fig.add_subplot(1, 1, 1, projection=proj)
+    ax.set_extent([-180, 180, -90, -55], crs=data_crs)
+
+    lon_v = _lon360_to_180(masks.lon.values)
+    lat_v = masks.lat.values
+
+    # Plot each domain as a separate contourf to avoid pcolormesh
+    # reprojection artifacts on polar stereo.
+    domain_styles = [
+        ("west_ocean",     "#6baed6"),
+        ("east_ocean",     "#fd8d3c"),
+        ("inland",         "#a1d99b"),
+        ("pen_west_slope", "#3182bd"),
+        ("pen_east_slope", "#e6550d"),
+    ]
+    for var, color in domain_styles:
+        field = masks[var].values.astype(float)
+        ax.contourf(
+            lon_v, lat_v, field,
+            levels=[0.5, 1.5], colors=[color], alpha=0.55,
+            transform=data_crs,
+        )
+
+    # t2m climatology contours
+    if t2m_clim is not None:
+        t2m = t2m_clim.squeeze(drop=True)
+        lon_t = _lon360_to_180(t2m.lon.values)
+        lat_t = t2m.lat.values
+        levels_t = np.arange(210, 275, 5)
+        cs = ax.contour(
+            lon_t, lat_t, t2m.values,
+            levels=levels_t, colors="k", linewidths=0.5,
+            transform=data_crs,
+        )
+        ax.clabel(cs, levels_t[::2], fontsize=6, fmt="%.0f")
+
+    # ERA5 coastline
+    lsm_v = lsm.sel(lat=masks.lat, lon=masks.lon).values
+    ax.contour(
+        lon_v, lat_v, lsm_v,
+        levels=[0.5], colors="k", linewidths=0.8,
+        transform=data_crs,
+    )
+
+    ax.gridlines(draw_labels=False, color="grey", alpha=0.3)
+
+    # legend
+    import matplotlib.patches as mpatches
+    legend_items = [
+        mpatches.Patch(color="#6baed6", alpha=0.6, label="West Ocean"),
+        mpatches.Patch(color="#fd8d3c", alpha=0.6, label="East Ocean"),
+        mpatches.Patch(color="#a1d99b", alpha=0.6, label="Inland"),
+        mpatches.Patch(color="#3182bd", alpha=0.6, label="Peninsula West"),
+        mpatches.Patch(color="#e6550d", alpha=0.6, label="Peninsula East"),
+    ]
+    ax.legend(handles=legend_items, loc="lower left", fontsize=8, framealpha=0.8)
+
+    title = "Analysis domains — all Antarctica"
+    if t2m_clim is not None:
+        title += "\nContours: March t2m climatology (K, 1988-2025)"
+    ax.set_title(title, fontsize=11)
+
+    plt.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved all-domain figure → {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
@@ -302,6 +491,132 @@ def plot_elevation_only(
     print(f"Saved elevation figure → {out_path}")
 
 
+def _load_etopo_antarctic(cache_path: Path, lat_north: float = -55.0) -> xr.DataArray:
+    """
+    Fetch ETOPO2022 surface elevation for Antarctica via NOAA THREDDS.
+    Downloads at stride-5 (~5-arcmin) resolution to keep transfer fast,
+    then caches locally as NetCDF.  Returns DataArray in metres.
+    """
+    if cache_path.exists():
+        print(f"Loading cached ETOPO → {cache_path}")
+        return xr.open_dataarray(cache_path)
+
+    print("Downloading ETOPO2022 Antarctic subset via THREDDS (stride=5) …")
+    url = (
+        "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/"
+        "60s/60s_surface_elev_netcdf/ETOPO_2022_v1_60s_N90W180_surface.nc"
+    )
+    ds = xr.open_dataset(url)
+    sub = ds["z"].sel(lat=slice(-90, lat_north)).isel(
+        lat=slice(None, None, 5), lon=slice(None, None, 5),
+    )
+    da = sub.load()
+    da.name = "etopo_elev"
+    da.attrs["units"] = "m"
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    da.to_netcdf(cache_path)
+    print(f"Cached ETOPO → {cache_path}  shape={da.shape}")
+    return da
+
+
+def _regrid_to_target(src: xr.DataArray, tgt_lat, tgt_lon) -> xr.DataArray:
+    """Bilinear interpolation of *src* onto target lat/lon grid."""
+    return src.interp(lat=tgt_lat, lon=tgt_lon, method="linear")
+
+
+def plot_era5_vs_reference(
+    elev_antarctic: xr.DataArray,
+    lsm_antarctic: xr.DataArray,
+    cache_dir: Path,
+    out_path: Path,
+) -> None:
+    """
+    Single-panel all-Antarctica comparison:
+      - bwr shading: ERA5 minus ETOPO2022 elevation difference
+      - Thin contours: ETOPO2022 at 500 m intervals
+      - Thick contours: ERA5 at 500 m intervals
+      - Coastline from Natural Earth + ERA5 LSM
+    """
+    if not HAS_CARTOPY:
+        print("Cartopy required for reference comparison — skipping.")
+        return
+
+    etopo = _load_etopo_antarctic(cache_dir / "etopo_antarctic.nc")
+
+    era5_m = elev_antarctic / G
+
+    # Align ETOPO lon (-180..180) → ERA5 lon (0..360) for difference
+    etopo_360 = etopo.assign_coords(lon=(etopo.lon % 360)).sortby("lon")
+    etopo_on_era5 = _regrid_to_target(etopo_360, era5_m.lat, era5_m.lon)
+    diff = era5_m - etopo_on_era5
+
+    proj = ccrs.SouthPolarStereo()
+    data_crs = ccrs.PlateCarree()
+    data_crs._threshold = data_crs._threshold / 100
+
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(1, 1, 1, projection=proj)
+    ax.set_extent([-180, 180, -90, -55], crs=data_crs)
+
+    lon_e = _lon360_to_180(era5_m.lon.values)
+    lat_e = era5_m.lat.values
+    lsm_v = lsm_antarctic.values
+    diff_land = np.where(lsm_v > 0.5, diff.values, np.nan)
+
+    vmax = float(np.nanpercentile(np.abs(diff_land), 98))
+    vmax = max(vmax, 50)
+    p = ax.pcolormesh(
+        lon_e, lat_e, diff_land,
+        transform=data_crs, cmap="bwr",
+        vmin=-vmax, vmax=vmax, alpha=0.7,
+    )
+
+    # --- ETOPO contours (thin) ---
+    levels = np.arange(500, 4500, 500)
+    ax.contour(
+        etopo.lon.values, etopo.lat.values, etopo.values,
+        levels=levels, colors="0.35", linewidths=0.6,
+        transform=data_crs,
+    )
+
+    # --- ERA5 contours (thick, land only) ---
+    era5_land = np.where(lsm_v > 0.5, era5_m.values, np.nan)
+    ax.contour(
+        lon_e, lat_e, era5_land,
+        levels=levels, colors="k", linewidths=1.4,
+        transform=data_crs,
+    )
+
+    # --- coastline ---
+    ax.contour(
+        lon_e, lat_e, lsm_v,
+        levels=[0.5], colors="k", linewidths=0.8, linestyles="--",
+        transform=data_crs,
+    )
+    try:
+        ax.coastlines(resolution="50m", linewidth=0.5, color="k")
+    except Exception:
+        pass
+
+    ax.gridlines(draw_labels=False, color="grey", alpha=0.3)
+    cb = plt.colorbar(p, ax=ax, shrink=0.6, pad=0.05)
+    cb.set_label("ERA5 − ETOPO2022 elevation difference (m)")
+
+    ax.set_title(
+        "Antarctic elevation: ERA5 (thick contour) vs ETOPO2022 (thin contour)\n"
+        "Contours every 500 m  ·  Shading = difference (bwr)",
+        fontsize=11,
+    )
+
+    plt.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved comparison figure → {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -336,6 +651,12 @@ def main():
     # --- elevation-only map ---
     plot_elevation_only(elev_wrap, lsm_wrap, pen_box, fig_dir / "elevation_wrapper.png")
 
+    # --- full Antarctic cap for ETOPO comparison ---
+    antarctic_box = {"lat_min": -90.0, "lat_max": -55.0, "lon_min": 0.0, "lon_max": 359.75}
+    lsm_ant = crop_to_box(lsm, antarctic_box)
+    elev_ant = crop_to_box(elev, antarctic_box)
+    plot_era5_vs_reference(elev_ant, lsm_ant, out_dir, fig_dir / "era5_vs_reference.png")
+
     # --- crop to peninsula ---
     lsm_pen = crop_to_box(lsm, pen_box)
     elev_pen = crop_to_box(elev, pen_box)
@@ -359,30 +680,48 @@ def main():
     n_east = int(east_mask.sum())
     print(f"West slope: {n_west} points   East slope: {n_east} points")
 
-    # --- domain figure ---
+    # --- peninsula zoom figure ---
     plot_domains(
         elev_wrap, lsm_wrap, elev_pen, lsm_pen,
         ridge_lon, west_mask, east_mask, pen_box,
         fig_dir / "peninsula_domains.png",
     )
 
-    # --- save masks as NetCDF ---
-    mask_ds = xr.Dataset(
-        {
-            "peninsula_land": land_pen.astype(np.int8),
-            "west_slope": west_mask.astype(np.int8),
-            "east_slope": east_mask.astype(np.int8),
-            "elevation_m": (elev_pen / G),
-            "ridge_lon": ridge_lon,
-        },
-        attrs={
-            "description": "Antarctic Peninsula domain masks derived from ERA5 invariants",
-            "peninsula_box": str(pen_box),
-        },
-    )
-    mask_path = out_dir / "peninsula_masks.nc"
-    mask_ds.to_netcdf(mask_path)
-    print(f"Saved masks → {mask_path}")
+    # --- full-grid domain masks (ocean, inland, peninsula) ---
+    antarctic_box = {"lat_min": -90.0, "lat_max": -55.0, "lon_min": 0.0, "lon_max": 359.75}
+    lsm_full = crop_to_box(lsm, antarctic_box)
+
+    print("\nBuilding full-grid domain masks …")
+    all_masks = build_full_domain_masks(lsm_full, pen_box, ridge_lon)
+
+    # --- load March climatology for overlay ---
+    clim_mar_path = root / "Data" / "F01_climatology" / "1988_2025" / "03" / "clim.nc"
+    t2m_clim = None
+    if clim_mar_path.exists():
+        ds_clim = xr.open_dataset(clim_mar_path)
+        for v in ["t2m", "T2m", "2t"]:
+            if v in ds_clim:
+                t2m_clim = ds_clim[v]
+                break
+        if t2m_clim is None and ds_clim.data_vars:
+            t2m_clim = ds_clim[list(ds_clim.data_vars)[0]]
+        if t2m_clim is not None:
+            if "latitude" in t2m_clim.coords:
+                t2m_clim = t2m_clim.rename({"latitude": "lat"})
+            if "longitude" in t2m_clim.coords:
+                t2m_clim = t2m_clim.rename({"longitude": "lon"})
+            print(f"Loaded March t2m climatology from {clim_mar_path}")
+    else:
+        print(f"March climatology not found at {clim_mar_path} — skipping overlay.")
+
+    plot_all_domains(all_masks, lsm, pen_box, t2m_clim, fig_dir / "all_domains.png")
+
+    # --- save masks ---
+    all_masks["elevation_m"] = crop_to_box(elev, antarctic_box) / G
+    all_masks["ridge_lon"] = ridge_lon
+    mask_path = out_dir / "all_domain_masks.nc"
+    all_masks.to_netcdf(mask_path)
+    print(f"Saved all masks → {mask_path}")
 
 
 if __name__ == "__main__":

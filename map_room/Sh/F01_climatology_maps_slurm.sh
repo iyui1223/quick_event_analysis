@@ -2,8 +2,8 @@
 #SBATCH --job-name=F01_climatology
 #SBATCH --output=/lustre/soge1/projects/andante/cenv1201/proj/quick_event_analysis/map_room/Log/F01_climatology_maps/slurm_%j.out
 #SBATCH --error=/lustre/soge1/projects/andante/cenv1201/proj/quick_event_analysis/map_room/Log/F01_climatology_maps/slurm_%j.err
-#SBATCH --time=02:00:00
-#SBATCH --partition=Short
+#SBATCH --time=04:00:00
+#SBATCH --partition=GPU
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 
