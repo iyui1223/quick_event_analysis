@@ -3,11 +3,11 @@
 #SBATCH --partition=Short
 #SBATCH --time=02:00:00
 #SBATCH --mem=8G
-#SBATCH --output=Log/F05_domain_timeseries/slurm_%j.out
-#SBATCH --error=Log/F05_domain_timeseries/slurm_%j.err
+#SBATCH --output=../Log/F05_domain_timeseries/slurm_%j.out
+#SBATCH --error=../Log/F05_domain_timeseries/slurm_%j.err
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="/lustre/soge1/projects/andante/cenv1201/proj/quick_event_analysis/map_room/Sh"
 ROOT="$(readlink -f "${SCRIPT_DIR}/..")"
 source "$(readlink -f "${ROOT}/Const/env_settings.sh")"
 

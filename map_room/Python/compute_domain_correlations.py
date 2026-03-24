@@ -237,7 +237,7 @@ def main():
 
     input_nc = Path(args.input) if args.input else root / corr_cfg.get("input_nc", "Data/F05_domain_timeseries/domain_timeseries.nc")
     sigma = corr_cfg.get("djf_filter_sigma", 15.0)
-    window_years = corr_cfg.get("window_years", 30)
+    window_years = corr_cfg.get("window_years", 10)
     step_years = corr_cfg.get("step_years", 5)
     detrend_cfg = corr_cfg.get("detrend", {})
     indices_cfg = corr_cfg.get("indices", {})

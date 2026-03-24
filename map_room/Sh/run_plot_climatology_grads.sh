@@ -42,6 +42,25 @@ for era in 1948_1987 1988_2025; do
   done
 done
 
+# U850/U500 climatology (if clim_u.nc exists)
+for era in 1948_1987 1988_2025; do
+  for month in 12 01 02 03; do
+    CLIMUNC="${DATA_CLIM}/${era}/${month}/clim_u.nc"
+    if [[ ! -f "${CLIMUNC}" ]]; then
+      continue
+    fi
+    mkdir -p "${FIG_CLIM}/${era}/${month}"
+    MONTH_LABEL=$(month_name "$month")
+    sed "s|DSET .*|DSET ${CLIMUNC}|" "${PROJECT_ROOT}/Sh/clim_u.ctl" > "${WORK_GRADS}/clim_u.ctl"
+    sed "s|TITLE_ERA|${era}|g; s|TITLE_MONTH|${MONTH_LABEL}|g" "${PROJECT_ROOT}/Sh/plot_climatology_u_grads.gs" > "${WORK_GRADS}/plot_climatology_u_grads.gs"
+    cd "${WORK_GRADS}"
+    grads -blcx "run plot_climatology_u_grads.gs"
+    mv -f u850_u500.png "${FIG_CLIM}/${era}/${month}/u850_u500.png"
+    cd - >/dev/null
+    echo "  U ${era} month ${month}"
+  done
+done
+
 # Diff maps (present − past) per month
 for month in 12 01 02 03; do
   PASTNC="${DATA_CLIM}/1948_1987/${month}/clim.nc"
@@ -60,6 +79,25 @@ for month in 12 01 02 03; do
   mv -f t2m_msl_diff.png "${FIG_CLIM}/diff/${month}/t2m_msl_diff.png"
   cd - >/dev/null
   echo "  diff month ${month}"
+done
+
+# U diff (present − past) per month
+for month in 12 01 02 03; do
+  PASTUNC="${DATA_CLIM}/1948_1987/${month}/clim_u.nc"
+  PRESUNC="${DATA_CLIM}/1988_2025/${month}/clim_u.nc"
+  if [[ ! -f "${PASTUNC}" || ! -f "${PRESUNC}" ]]; then
+    continue
+  fi
+  mkdir -p "${FIG_CLIM}/diff/${month}"
+  MONTH_LABEL=$(month_name "$month")
+  sed "s|DSET .*|DSET ${PASTUNC}|" "${PROJECT_ROOT}/Sh/clim_u.ctl" > "${WORK_GRADS}/clim_u_past.ctl"
+  sed "s|DSET .*|DSET ${PRESUNC}|" "${PROJECT_ROOT}/Sh/clim_u.ctl" > "${WORK_GRADS}/clim_u_present.ctl"
+  sed "s|TITLE_MONTH|${MONTH_LABEL}|g" "${PROJECT_ROOT}/Sh/plot_climatology_u_diff_grads.gs" > "${WORK_GRADS}/plot_climatology_u_diff_grads.gs"
+  cd "${WORK_GRADS}"
+  grads -blcx "run plot_climatology_u_diff_grads.gs"
+  mv -f u850_u500_diff.png "${FIG_CLIM}/diff/${month}/u850_u500_diff.png"
+  cd - >/dev/null
+  echo "  U diff month ${month}"
 done
 
 echo "GrADS climatology and diff maps written to ${FIG_CLIM}/"
