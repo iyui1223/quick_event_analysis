@@ -23,4 +23,9 @@ ${PYTHON} Python/compute_domain_correlations.py \
     --out-dir "${DATA_DIR}/${STEP_ID}" \
     2>&1 | tee "${LOG_DIR}/${STEP_ID}/compute.log"
 
+${PYTHON} Python/plot_domain_correlation_tiles.py \
+    --input "${DATA_DIR}/${STEP_ID}/domain_correlations.csv" \
+    --out-dir "${ROOT}/Figs/${STEP_ID}" \
+    2>&1 | tee "${LOG_DIR}/${STEP_ID}/plot.log"
+
 echo "=== ${STEP_ID} complete ==="

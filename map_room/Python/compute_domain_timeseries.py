@@ -1,7 +1,7 @@
 """
 Compute lat-weighted area-mean time series of t2m and msl per domain.
 
-Data source: /lustre/soge1/projects/andante/cenv1201/heavy/ERA5/daily/Surf/slices/YYYYMM.nc
+Data source: /lustre/soge1/projects/andante/cenv1201/heavy/ERA5/daily/Surf/YYYYMM.nc
 Files are zip archives from CDS containing one NetCDF per variable.
 Domain masks: Data/F04_peninsula_domains/all_domain_masks.nc
 
@@ -21,7 +21,7 @@ import xarray as xr
 # Paths
 # -----------------------------------------------------------------------------
 
-SLICES_DIR = Path("/lustre/soge1/projects/andante/cenv1201/heavy/ERA5/daily/Surf/slices")
+SLICES_DIR = Path("/lustre/soge1/projects/andante/cenv1201/heavy/ERA5/daily/Surf")
 MASKS_PATH = Path(__file__).resolve().parent.parent / "Data" / "F04_peninsula_domains" / "all_domain_masks.nc"
 
 # Slice region: 60S-90S, lon 255-345 (105W-15W)

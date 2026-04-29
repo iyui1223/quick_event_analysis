@@ -3,13 +3,14 @@
 F08: Compare READER station obs vs reanalysis nearest-neighbour time series.
 
 Stations: Adelaide, Deception, Esperanza, Fossil_Bluff, FaradayVernadsky, Marambio.
-Variables: t2m (°C), msl (hPa), u10/v10/wspd (m/s).
+Reanalyses: ERA5 daily surface NetCDF/zip archives and JRA-3Q anl_surf125 GRIB2.
+Variables: t2m (°C), msl/prmsl (hPa), u10/v10/wspd (m/s).
 
 Reanalysis point extractions are cached under
 ``<data-dir>/reanalysis_cache/<REANALYSIS>/<Station>.pkl``.
 
 Workflow:
-  1. First run (or after source change):  --clear-cache  (rebuilds from raw zips)
+  1. First run (or after source change):  --clear-cache  (rebuilds from raw files)
   2. Subsequent runs:                     --use-cached   (fast figure-only replot)
   3. Default (no flag):                   extract + overwrite cache
 
@@ -24,7 +25,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -48,11 +51,11 @@ ERA5_DIR_DEFAULT = Path(
 READER_DIR_DEFAULT = Path(
     "/lustre/soge1/projects/andante/cenv1201/heavy/READER/SURFACE"
 )
-JRA3Q_DIR = Path("/lustre/soge1/data/analysis/jra-q3/anl_surf125")
+JRA3Q_DIR_DEFAULT = Path("/lustre/soge1/data/analysis/jra-q3/anl_surf125")
 
 REANALYSIS_STYLES: dict[str, dict] = {
     "ERA5": {"color": "r"},
-    # "JRA3Q": {"color": "g"},  # activate when JRA-3Q loader is ready
+    "JRA-3Q": {"color": "g"},
 }
 OBS_STYLE = {"color": "b"}
 
@@ -169,6 +172,188 @@ def extract_era5_point(
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).set_index("time").sort_index()
+
+
+# ---------------------------------------------------------------------------
+# JRA-3Q 6-hourly GRIB2 I/O
+# ---------------------------------------------------------------------------
+
+_JRA3Q_FILE_RE = re.compile(r"^anl_surf125\.(\d{10})$")
+_JRA3Q_VAR_MAP = {
+    "2t": "t2m",
+    "prmsl": "msl",
+    "10u": "u10",
+    "10v": "v10",
+}
+
+
+def _coord_key(lon: float, lat: float) -> tuple[float, float]:
+    return round(float(lon) % 360.0, 4), round(float(lat), 4)
+
+
+def _jra3q_month_groups(
+    jra3q_dir: Path,
+    end_year: int,
+    limit_months: int | None = None,
+) -> list[tuple[str, list[Path]]]:
+    """Return JRA-3Q 6-hourly GRIB files grouped by YYYYMM."""
+    by_month: dict[str, list[Path]] = {}
+    for fp in sorted(jra3q_dir.glob("anl_surf125.*")):
+        m = _JRA3Q_FILE_RE.match(fp.name)
+        if not m:
+            continue
+        stamp = m.group(1)
+        if int(stamp[:4]) > end_year:
+            continue
+        by_month.setdefault(stamp[:6], []).append(fp)
+
+    groups = sorted(by_month.items())
+    if limit_months is not None:
+        groups = groups[:limit_months]
+    return groups
+
+
+def _write_cdo_station_grid(
+    tmp_dir: Path,
+    station_points: dict[str, dict],
+) -> Path:
+    grid_path = tmp_dir / "jra3q_station_points.grid"
+    stations = list(station_points)
+    xvals = " ".join(f"{float(station_points[st]['lon']):.6f}" for st in stations)
+    yvals = " ".join(f"{float(station_points[st]['lat']):.6f}" for st in stations)
+    grid_path.write_text(
+        "\n".join([
+            "gridtype = unstructured",
+            f"gridsize = {len(stations)}",
+            f"xvals = {xvals}",
+            f"yvals = {yvals}",
+            "",
+        ])
+    )
+    return grid_path
+
+
+def _parse_jra3q_outputtab(
+    text: str,
+    station_lookup: dict[tuple[float, float], str],
+    out: dict[str, dict[pd.Timestamp, dict[str, float]]],
+) -> None:
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        date_s, time_s, lon_s, lat_s, name, value_s = parts[:6]
+        col = _JRA3Q_VAR_MAP.get(name)
+        if col is None:
+            continue
+        station = station_lookup.get(_coord_key(float(lon_s), float(lat_s)))
+        if station is None:
+            continue
+        try:
+            value = float(value_s)
+        except ValueError:
+            value = np.nan
+        ts = pd.Timestamp(f"{date_s} {time_s}")
+        out[station].setdefault(ts, {})[col] = value
+
+
+def _run_cdo_jra3q_extract(
+    files: list[Path],
+    grid_path: Path,
+) -> str:
+    cmd = [
+        "cdo", "-s",
+        "outputtab,date,time,lon,lat,name,value",
+        f"-remapnn,{grid_path}",
+        "-selname,2t,prmsl,10u,10v",
+        "-cat",
+        "[",
+        *(str(fp) for fp in files),
+        "]",
+    ]
+    res = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if res.returncode != 0:
+        msg = res.stderr.strip() or res.stdout.strip()
+        raise RuntimeError(msg[-1000:])
+    return res.stdout
+
+
+def _jra3q_to_daily(df_6h: pd.DataFrame) -> pd.DataFrame:
+    df = df_6h.copy()
+    if "t2m" in df:
+        df["t2m"] = df["t2m"] - 273.15
+    if "msl" in df:
+        df["msl"] = df["msl"] / 100.0
+    daily = df.resample("D").mean().dropna(how="all")
+    if "u10" in daily and "v10" in daily:
+        daily["wspd"] = np.sqrt(daily["u10"] ** 2 + daily["v10"] ** 2)
+    return daily
+
+
+def extract_jra3q_points(
+    jra3q_dir: Path,
+    station_points: dict[str, dict],
+    jra3q_end_year: int = 2025,
+    limit_months: int | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Extract JRA-3Q nearest-neighbour daily t2m, msl, u10, v10, wspd."""
+    if shutil.which("cdo") is None:
+        raise RuntimeError("JRA-3Q extraction requires the 'cdo' command")
+
+    month_groups = _jra3q_month_groups(
+        jra3q_dir,
+        end_year=jra3q_end_year,
+        limit_months=limit_months,
+    )
+    if not month_groups:
+        return {}
+
+    station_lookup: dict[tuple[float, float], str] = {}
+    for station, sc in station_points.items():
+        key = _coord_key(sc["lon"], sc["lat"])
+        if key in station_lookup:
+            raise ValueError(
+                f"Duplicate station point for {station} and "
+                f"{station_lookup[key]} at lon/lat {key}"
+            )
+        station_lookup[key] = station
+
+    raw: dict[str, dict[pd.Timestamp, dict[str, float]]] = {
+        station: {} for station in station_points
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        grid_path = _write_cdo_station_grid(Path(tmp), station_points)
+        for i, (yyyymm, files) in enumerate(month_groups):
+            if (i + 1) % 60 == 0:
+                print(
+                    f"    JRA-3Q: {i + 1}/{len(month_groups)} months...",
+                    flush=True,
+                )
+            try:
+                text = _run_cdo_jra3q_extract(files, grid_path)
+                _parse_jra3q_outputtab(text, station_lookup, raw)
+            except Exception as exc:
+                print(f"    Warning: JRA-3Q {yyyymm}: {exc}", flush=True)
+
+    out: dict[str, pd.DataFrame] = {}
+    for station, by_time in raw.items():
+        if not by_time:
+            continue
+        df_6h = pd.DataFrame.from_dict(by_time, orient="index").sort_index()
+        df_6h.index.name = "time"
+        daily = _jra3q_to_daily(df_6h)
+        if len(daily) > 0:
+            out[station] = daily
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +645,146 @@ def plot_monthly_variance(
 
 
 # ---------------------------------------------------------------------------
+# Plot: SLP correlation scatter (daily mean + monthly mean)
+# ---------------------------------------------------------------------------
+
+def _pearson_r(s1: pd.Series, s2: pd.Series) -> tuple[float, int] | None:
+    common = s1.dropna().index.intersection(s2.dropna().index)
+    if len(common) < 3:
+        return None
+    a = s1.loc[common].to_numpy()
+    b = s2.loc[common].to_numpy()
+    if np.nanstd(a) == 0 or np.nanstd(b) == 0:
+        return None
+    r = float(np.corrcoef(a, b)[0, 1])
+    return r, len(common)
+
+
+def _decade_color_map(decades: list[int]) -> dict[int, tuple[float, float, float]]:
+    """
+    Build decade colors with a deliberate era split:
+      - <= 1970s: blue -> green
+      - >= 1980s: red  -> orange
+    """
+    cmap: dict[int, tuple[float, float, float]] = {}
+    pre = sorted(d for d in decades if d <= 1970)
+    post = sorted(d for d in decades if d >= 1980)
+
+    def _interp(c0: tuple[float, float, float],
+                c1: tuple[float, float, float],
+                t: float) -> tuple[float, float, float]:
+        return tuple((1.0 - t) * a + t * b for a, b in zip(c0, c1))
+
+    pre_start = (0.10, 0.30, 0.90)   # blue
+    pre_end = (0.10, 0.72, 0.35)     # green
+    post_start = (0.86, 0.10, 0.10)  # red
+    post_end = (0.95, 0.55, 0.10)    # orange
+
+    for i, d in enumerate(pre):
+        t = 0.5 if len(pre) == 1 else i / (len(pre) - 1)
+        cmap[d] = _interp(pre_start, pre_end, t)
+    for i, d in enumerate(post):
+        t = 0.5 if len(post) == 1 else i / (len(post) - 1)
+        cmap[d] = _interp(post_start, post_end, t)
+    return cmap
+
+
+def plot_slp_correlation(
+    station: str,
+    reader_df: pd.DataFrame | None,
+    reanalysis_data: dict[str, dict[str, pd.DataFrame]],
+    out_dir: Path,
+) -> None:
+    if reader_df is None or "slp" not in reader_df.columns:
+        return
+
+    reader_daily = reader_df["slp"].dropna()
+    if len(reader_daily) == 0:
+        return
+    reader_monthly = reader_daily.resample("ME").mean().dropna()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    panels = [
+        ("Daily mean SLP", reader_daily, axes[0]),
+        ("Monthly mean SLP", reader_monthly, axes[1]),
+    ]
+
+    for title, reader_series, ax in panels:
+        all_x: list[np.ndarray] = []
+        all_y: list[np.ndarray] = []
+        decade_handles: dict[int, object] = {}
+
+        for rean, sty in REANALYSIS_STYLES.items():
+            rean_st = reanalysis_data.get(rean, {}).get(station)
+            if rean_st is None or "msl" not in rean_st.columns:
+                continue
+
+            rean_series = rean_st["msl"].dropna()
+            if title.startswith("Monthly"):
+                rean_series = rean_series.resample("ME").mean().dropna()
+
+            common = reader_series.index.intersection(rean_series.index)
+            if len(common) < 3:
+                continue
+            x = reader_series.loc[common].to_numpy()
+            y = rean_series.loc[common].to_numpy()
+            years = common.year
+            decades = sorted(np.unique((years // 10) * 10).tolist())
+            decade_colors = _decade_color_map(decades)
+
+            for dec in decades:
+                m = ((years // 10) * 10) == dec
+                if not np.any(m):
+                    continue
+                sc = ax.scatter(
+                    x[m], y[m], s=10, alpha=0.45,
+                    color=decade_colors[dec],
+                    label=f"{dec}s",
+                )
+                decade_handles.setdefault(dec, sc)
+
+            all_x.append(x)
+            all_y.append(y)
+
+            corr = _pearson_r(reader_series, rean_series)
+            if corr is not None:
+                r, n = corr
+                ax.text(
+                    0.03, 0.95 - 0.08 * list(REANALYSIS_STYLES).index(rean),
+                    f"{rean}: r={r:.3f}, n={n}",
+                    transform=ax.transAxes, ha="left", va="top",
+                    fontsize=8, color=sty["color"],
+                    bbox=dict(boxstyle="round,pad=0.25",
+                              facecolor="white", alpha=0.8),
+                )
+
+        if all_x and all_y:
+            x_all = np.concatenate(all_x)
+            y_all = np.concatenate(all_y)
+            vmin = float(np.nanmin(np.concatenate([x_all, y_all])))
+            vmax = float(np.nanmax(np.concatenate([x_all, y_all])))
+            ax.plot([vmin, vmax], [vmin, vmax], "k--", lw=1, alpha=0.6)
+            ax.set_xlim(vmin, vmax)
+            ax.set_ylim(vmin, vmax)
+        ax.set_title(title)
+        ax.set_xlabel("READER SLP (hPa)")
+        ax.set_ylabel("Reanalysis SLP (hPa)")
+        ax.grid(True, alpha=0.3)
+        if decade_handles:
+            handles = [decade_handles[d] for d in sorted(decade_handles)]
+            labels = [f"{d}s" for d in sorted(decade_handles)]
+            ax.legend(handles, labels, loc="lower right", fontsize=8,
+                      title="Decade", title_fontsize=8)
+
+    fig.suptitle(f"{station}: SLP correlation (READER vs Reanalysis)")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{station}_slp_correlation_daily_monthly.png",
+                dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {station}_slp_correlation_daily_monthly.png")
+
+
+# ---------------------------------------------------------------------------
 # Plot: wind-component monthly-variance panel (u, v, wspd)
 # ---------------------------------------------------------------------------
 
@@ -549,16 +874,22 @@ def main() -> None:
     ap.add_argument("--reader-dir", type=Path, default=READER_DIR_DEFAULT)
     ap.add_argument("--era5-dir", type=Path, default=ERA5_DIR_DEFAULT,
                     help="Directory with ERA5 YYYYMM.nc zip archives")
+    ap.add_argument("--jra3q-dir", type=Path, default=JRA3Q_DIR_DEFAULT,
+                    help="Directory with JRA-3Q anl_surf125.YYYYMMDDHH GRIB2 files")
     ap.add_argument("--stations-yaml", type=Path,
                     default=ROOT / "Const" / "reader_stations.yaml")
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--era5-end-year", type=int, default=2025)
+    ap.add_argument("--jra3q-end-year", type=int, default=None,
+                    help="Last JRA-3Q year to extract (defaults to --era5-end-year)")
     ap.add_argument("--limit-months", type=int, default=None)
+    ap.add_argument("--skip-jra3q", action="store_true",
+                    help="Only compare READER with ERA5")
     ap.add_argument("--use-cached", action="store_true",
                     help="Load reanalysis from cache only (no zip I/O)")
     ap.add_argument("--clear-cache", action="store_true",
                     help="Delete existing cache before extraction "
-                         "(use once when changing ERA5 source)")
+                         "(use once when changing reanalysis sources)")
     ap.add_argument("--data-dir", type=Path, default=None,
                     help="F08 data root (cache lives here)")
     args = ap.parse_args()
@@ -653,10 +984,53 @@ def main() -> None:
             print(f"\nCached ERA5 → {era5_cache}", flush=True)
         reanalysis_data["ERA5"] = era5_stations
 
-    # ── (future) JRA-3Q slot ─────────────────────────────────────────────
-    # When ready, add:
-    #   reanalysis_data["JRA3Q"] = _load_or_extract_jra3q(...)
-    #   REANALYSIS_STYLES["JRA3Q"] = {"color": "g"}
+    # ── JRA-3Q ───────────────────────────────────────────────────────────
+    if not args.skip_jra3q:
+        jra3q_cache = _cache_dir(data_dir, "JRA-3Q")
+        if args.use_cached:
+            loaded = _load_all_cached(jra3q_cache, stations)
+            if loaded is None:
+                missing = [s for s in stations
+                           if _read_cached(jra3q_cache, s) is None]
+                print(
+                    f"Missing JRA-3Q cache for: {missing}. "
+                    f"Run without --use-cached to build from {args.jra3q_dir}.",
+                    file=sys.stderr, flush=True,
+                )
+                sys.exit(1)
+            reanalysis_data["JRA-3Q"] = loaded
+            print("JRA-3Q: loaded from cache (--use-cached)", flush=True)
+            for st, df in loaded.items():
+                print(f"  {st}: {df.index.min().date()} – "
+                      f"{df.index.max().date()}, n={len(df)}")
+        else:
+            jra3q_end_year = (
+                args.jra3q_end_year
+                if args.jra3q_end_year is not None
+                else args.era5_end_year
+            )
+            print(
+                f"\nExtracting JRA-3Q nearest-neighbour from {args.jra3q_dir} ...",
+                flush=True,
+            )
+            jra3q_stations = extract_jra3q_points(
+                args.jra3q_dir,
+                {st: cfg["stations"][st] for st in stations},
+                jra3q_end_year=jra3q_end_year,
+                limit_months=args.limit_months,
+            )
+            for st in stations:
+                df = jra3q_stations.get(st)
+                if df is not None and len(df) > 0:
+                    print(f"  {st}: {df.index.min().date()} – "
+                          f"{df.index.max().date()}, n={len(df)}")
+                else:
+                    print(f"  {st}: no JRA-3Q data")
+
+            if jra3q_stations and args.limit_months is None:
+                _save_all_cached(jra3q_cache, jra3q_stations)
+                print(f"\nCached JRA-3Q → {jra3q_cache}", flush=True)
+            reanalysis_data["JRA-3Q"] = jra3q_stations
 
     # ── plotting ─────────────────────────────────────────────────────────
     print("\n--- Plotting ---", flush=True)
@@ -667,6 +1041,7 @@ def main() -> None:
         plot_timeseries(st, rd, reanalysis_data, out_dir)
         plot_decadal_trend(st, rd, reanalysis_data, out_dir)
         plot_monthly_variance(st, rd, reanalysis_data, out_dir)
+        plot_slp_correlation(st, rd, reanalysis_data, out_dir)
         plot_wind_component_variance(st, rd, reanalysis_data, out_dir)
 
     # ── summary CSV ──────────────────────────────────────────────────────

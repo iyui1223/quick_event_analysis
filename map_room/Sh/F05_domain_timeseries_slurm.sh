@@ -12,7 +12,7 @@ ROOT="$(readlink -f "${SCRIPT_DIR}/..")"
 source "$(readlink -f "${ROOT}/Const/env_settings.sh")"
 
 STEP_ID="F05_domain_timeseries"
-SLICES_DIR="${SLICES_DIR:-/lustre/soge1/projects/andante/cenv1201/heavy/ERA5/daily/Surf/slices}"
+SLICES_DIR="${SLICES_DIR:-/lustre/soge1/projects/andante/cenv1201/heavy/ERA5/daily/Surf}"
 
 mkdir -p "${LOG_DIR}/${STEP_ID}" "${DATA_DIR}/${STEP_ID}"
 

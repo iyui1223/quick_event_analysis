@@ -5,7 +5,7 @@ Steps:
   0. Remove seasonal cycle (daily climatology)
   1. Optional detrending (linear, ENSO, SAM, PDO) - switchable
   2. Apply DJF seasonal filter (2-tanh style)
-  3. Sliding 30-year window correlation, 5-year step
+  3. Sliding 10-year window correlation, 5-year step, with optional day lags
   4. Save to CSV
 
 Indices: use centralized analogue Const (PSL .data format: year + 12 monthly values).
@@ -180,6 +180,7 @@ def sliding_correlation(
     domains: list[str],
     window_years: int,
     step_years: int,
+    lag_days: list[int],
 ) -> pd.DataFrame:
     """Compute correlation matrix for each sliding window. Returns long-form CSV-friendly df."""
     years = np.unique(ds.time.dt.year.values)
@@ -198,21 +199,28 @@ def sliding_correlation(
             v2 = f"{var}_{d2}"
             if v1 not in sub or v2 not in sub:
                 continue
-            a = sub[v1].values
-            b = sub[v2].values
-            valid = np.isfinite(a) & np.isfinite(b)
-            if valid.sum() < 100:
-                continue
-            r = np.corrcoef(a[valid], b[valid])[0, 1]
-            rows.append({
-                "var": var,
-                "domain_a": d1,
-                "domain_b": d2,
-                "window_start": start,
-                "window_end": end - 1,
-                "correlation": r,
-                "n_valid": int(valid.sum()),
-            })
+            a = sub[v1]
+            b = sub[v2]
+
+            for lag in lag_days:
+                # Positive lag compares domain_a(t) with domain_b(t + lag).
+                b_lagged = b.shift(time=-lag) if lag != 0 else b
+                av = a.values
+                bv = b_lagged.values
+                valid = np.isfinite(av) & np.isfinite(bv)
+                if valid.sum() < 100:
+                    continue
+                r = np.corrcoef(av[valid], bv[valid])[0, 1]
+                rows.append({
+                    "var": var,
+                    "domain_a": d1,
+                    "domain_b": d2,
+                    "lag_days": int(lag),
+                    "window_start": start,
+                    "window_end": end - 1,
+                    "correlation": r,
+                    "n_valid": int(valid.sum()),
+                })
 
     return pd.DataFrame(rows)
 
@@ -239,6 +247,7 @@ def main():
     sigma = corr_cfg.get("djf_filter_sigma", 15.0)
     window_years = corr_cfg.get("window_years", 10)
     step_years = corr_cfg.get("step_years", 5)
+    lag_days = corr_cfg.get("lag_days", [-3, -2, -1, 0, 1, 2, 3])
     detrend_cfg = corr_cfg.get("detrend", {})
     indices_cfg = corr_cfg.get("indices", {})
 
@@ -288,7 +297,7 @@ def main():
     all_dfs = []
     for bv, sub in processed.items():
         doms = [k.replace(f"{bv}_", "", 1) for k in sub.data_vars if k.startswith(f"{bv}_")]
-        df = sliding_correlation(sub, bv, doms, window_years, step_years)
+        df = sliding_correlation(sub, bv, doms, window_years, step_years, lag_days)
         all_dfs.append(df)
 
     if all_dfs:
